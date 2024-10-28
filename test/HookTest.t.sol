@@ -50,13 +50,13 @@ contract HookTest is Test, Fixtures {
         address flags = address(
             uint160(
                 Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG
-                    | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG
+                    | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_INITIALIZE_FLAG
+                    | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
             ) ^ (0x4444 << 144) // Namespace the hook to avoid collisions
         );
         bytes memory constructorArgs = abi.encode(address(this), manager); //Add all the necessary constructor arguments from the hook
         deployCodeTo("Hook.sol:Hook", constructorArgs, flags);
         hook = Hook(flags);
-
 
         // Create the pool
         uint24 fee = 3000;
@@ -95,11 +95,8 @@ contract HookTest is Test, Fixtures {
         // send token to user
 
         seedBalance(user); //10_000_000e18
-        seedBalance(address(magic)); //10_000_000e18
+        // seedBalance(address(magic)); //10_000_000e18
         approvePosmFor(user);
-
-        
-
 
         // user approve all the routers
         vm.startPrank(user);
@@ -183,6 +180,7 @@ contract HookTest is Test, Fixtures {
         console.log("userToken0Balance: %e", currency0.balanceOf(user));
         console.log("userToken1Balance: %e", currency1.balanceOf(user));
     }
+
     function _printDebug(BalanceDelta swapDelta) private {
         console.log("deltaAmount0: %e", swapDelta.amount0());
         console.log("deltaAmount1: %e", swapDelta.amount1());

@@ -4,7 +4,7 @@ pragma solidity ^0.8.24;
 import {Currency} from "v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
-import {PositionManager} from "v4-periphery/src/PositionManager.sol";
+import {PositionManager, IWETH9} from "v4-periphery/src/PositionManager.sol";
 import {IPositionManager} from "v4-periphery/src/interfaces/IPositionManager.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
@@ -17,6 +17,7 @@ import {IEIP712_v4} from "v4-periphery/src/interfaces/IEIP712_v4.sol";
 import {ERC721PermitHash} from "v4-periphery/src/libraries/ERC721PermitHash.sol";
 import {IPositionDescriptor} from "v4-periphery/src/interfaces/IPositionDescriptor.sol";
 
+import {WETH} from "solmate/src/tokens/WETH.sol";
 /// @notice A shared test contract that wraps the v4-core deployers contract and exposes basic liquidity operations on posm.
 contract Fixtures is Deployers, DeployPermit2 {
     uint256 constant STARTING_USER_BALANCE = 10_000_000 ether;
@@ -24,7 +25,7 @@ contract Fixtures is Deployers, DeployPermit2 {
     uint256 constant MAX_SLIPPAGE_REMOVE_LIQUIDITY = 0;
 
     IPositionManager posm;
-
+    IWETH9 public _WETH9 = IWETH9(address(new WETH()));
     function deployAndApprovePosm(IPoolManager poolManager) public {
         deployPosm(poolManager);
         approvePosm();
@@ -33,7 +34,7 @@ contract Fixtures is Deployers, DeployPermit2 {
     function deployPosm(IPoolManager poolManager) internal {
         // We use vm.etch to prevent having to use via-ir in this repository.
         etchPermit2();
-        posm = IPositionManager(new PositionManager(poolManager, permit2, 300_000, IPositionDescriptor(address(0))));
+        posm = IPositionManager(new PositionManager(poolManager, permit2, 300_000, IPositionDescriptor(address(0)),_WETH9));
     }
 
     function seedBalance(address to) internal {

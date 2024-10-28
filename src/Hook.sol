@@ -3,6 +3,7 @@ pragma solidity ^0.8.0;
 
 import {BaseHook} from "v4-periphery/src/base/hooks/BaseHook.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
+import {LPFeeLibrary} from "v4-core/src/libraries/LPFeeLibrary.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
@@ -15,11 +16,12 @@ import "./DoorLock.sol";
 import "./libraries/Security.sol";
 
 /// @title Uniswap Hook for private pool refund 100% fee back.
-/// @notice Only take fee from input token. Fee is fixed.
-/// @dev Not support change fee dynamically.
+/// @notice Fee is forced to be 0% for this hook. Official Web interface will include how much fee is taken for normal user.
+/// @notice Bot contract allowed to use this hook with empty data to swap for free as intended.
+/// @dev fee is optional from HookData. This allow take fee from input or output token directly much more gas-cost efficient.
+/// @dev dynamic fee only take from input token. For PoolLiquidity holder this seem right.
+/// But from user perspective want free cashback. User must have option to choose what kind of final asset they want to hold without extra steps through router.
 contract Hook is DoorLock, BaseHook {
-    mapping(address => bool) public isTokenAllowed;
-
     event TokenWhitelistUpdated(address token, bool isAllowed);
 
     error OnlyPoolManager();
@@ -28,7 +30,6 @@ contract Hook is DoorLock, BaseHook {
 
     ///@dev immutable variable does not work with Hook struct.
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
-        
         return Hooks.Permissions({
             beforeInitialize: true, //prevent unknown pool hook by mistake
             afterInitialize: false,
@@ -47,24 +48,13 @@ contract Hook is DoorLock, BaseHook {
         });
     }
 
-    function whitelistToken(address _token, bool _isAllowed) external onlyOwner {
-        isTokenAllowed[_token] = _isAllowed;
-        emit TokenWhitelistUpdated(_token, _isAllowed);
-    }
-
-    function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
-        return hookPermissions;
-    }
-
     //* EXPLICIT ADMIN POOL INTERACTION *//
 
-    function beforeInitialize(address , PoolKey calldata _poolKey, uint160)
-        external
-        virtual
-        override
-        returns (bytes4)
-    {
+    function beforeInitialize(address, PoolKey calldata _poolKey, uint160) external virtual override returns (bytes4) {
+        //Always assume trusted admin know what they are doing
         _checkSecurity(Security.BASIC);
+        require(_poolKey.hooks == IHooks(address(this)), "Wrong Hook");
+        require(_poolKey.fee == 0, "Fee must be 0");
         return BaseHook.beforeInitialize.selector;
     }
 
@@ -100,7 +90,7 @@ contract Hook is DoorLock, BaseHook {
         IPoolManager.SwapParams calldata _swapParams,
         bytes calldata
     ) external override returns (bytes4, BeforeSwapDelta, uint24) {
-        require(msg.sender == address(poolManager), OnlyPoolManager);
+        require(msg.sender == address(poolManager), OnlyPoolManager());
 
         //amountSpecified < 0  means taking exactInput
         if (_swapParams.amountSpecified < 0 && _poolKey.fee > 0) {
