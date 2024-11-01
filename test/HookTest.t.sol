@@ -13,13 +13,18 @@ import {CurrencyLibrary, Currency} from "v4-core/src/types/Currency.sol";
 import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
+import {LPFeeLibrary} from "v4-core/src/libraries/LPFeeLibrary.sol";
+import {FullMath} from "v4-core/src/libraries/FullMath.sol";
 
 import {LiquidityAmounts} from "v4-core/test/utils/LiquidityAmounts.sol";
 import {IPositionManager} from "v4-periphery/src/interfaces/IPositionManager.sol";
+
+import {PositionConfig, FeeMath} from "v4-periphery/test/shared/FeeMath.sol";
+
 import {EasyPosm} from "./utils/EasyPosm.sol";
 import {Fixtures} from "./utils/Fixtures.sol";
 
-import {Hook} from "src/Hook.sol";
+import "src/Hook.sol";
 
 contract HookTest is Test, Fixtures {
     using EasyPosm for IPositionManager;
@@ -30,21 +35,20 @@ contract HookTest is Test, Fixtures {
     Hook hook;
 
     PoolId poolId;
+    PositionConfig mainPosKey;
 
     uint256 tokenId;
     int24 tickLower;
     int24 tickUpper;
 
-    address user = address(0xcafe);
+    address user = address(0xCAfE2290dD7278aa3DDD389Cc1E1d165cC4BCafE);
+    address owner = address(this);
 
     function setUp() public {
         // creates the pool manager, utility routers, and test tokens
         deployFreshManagerAndRouters();
         deployMintAndApprove2Currencies();
-
         deployAndApprovePosm(manager);
-
-        //@create Hook to Anvil
 
         // Deploy the hook to an address with the correct flags
         address flags = address(
@@ -54,12 +58,14 @@ contract HookTest is Test, Fixtures {
                     | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
             ) ^ (0x4444 << 144) // Namespace the hook to avoid collisions
         );
-        bytes memory constructorArgs = abi.encode(address(this), manager); //Add all the necessary constructor arguments from the hook
+        bytes memory constructorArgs = abi.encode(owner, manager); //Add all the necessary constructor arguments from the hook
         deployCodeTo("Hook.sol:Hook", constructorArgs, flags);
         hook = Hook(flags);
+        //tell hook to unlock permission first before Add new liquidity
+        hook.unlock(Security.BASIC);
 
         // Create the pool
-        uint24 fee = 3000;
+        uint24 fee = LPFeeLibrary.DYNAMIC_FEE_FLAG;
         key = PoolKey(currency0, currency1, fee, 60, IHooks(hook));
         poolId = key.toId();
         manager.initialize(key, SQRT_PRICE_1_1);
@@ -79,8 +85,6 @@ contract HookTest is Test, Fixtures {
 
         // console.log("Pool token balance. amount0: %e, amount1: %e", amount0Expected, amount1Expected);
 
-        bytes memory unlockSignature = abi.encode(bytes32(uint256(0x1337)));
-
         (tokenId,) = posm.mint(
             key,
             tickLower,
@@ -90,12 +94,15 @@ contract HookTest is Test, Fixtures {
             amount1Expected + 1,
             address(this),
             block.timestamp,
-            unlockSignature
+            ZERO_BYTES
         );
-        // send token to user
+        mainPosKey = PositionConfig({poolKey: key, tickLower: tickLower, tickUpper: tickUpper});
 
+        // lock admin permission after setup done
+        hook.lock();
+
+        // send token to user
         seedBalance(user); //10_000_000e18
-        // seedBalance(address(magic)); //10_000_000e18
         approvePosmFor(user);
 
         // user approve all the routers
@@ -119,6 +126,140 @@ contract HookTest is Test, Fixtures {
         }
         vm.stopPrank();
     }
+
+    /* HELPER */
+    function parseAndUnpack(bytes calldata data)
+        public
+        pure
+        returns (bool feeOnInput, uint24 feeBps, address refundTo)
+    {
+        (feeOnInput, feeBps, refundTo) = HookLibrary.softParse(data);
+    }
+
+    function _printOwnedFee() private view {
+        BalanceDelta feesOwed = FeeMath.getFeesOwed(posm, manager, mainPosKey, tokenId);
+        console.log("feesOwedAmount0: %e", feesOwed.amount0());
+        console.log("feesOwedAmount1: %e", feesOwed.amount1());
+    }
+
+    function _printStartingBalance() private view {
+        console.log("userToken0Balance: %e", currency0.balanceOf(user));
+        console.log("userToken1Balance: %e", currency1.balanceOf(user));
+    }
+
+    function _printDebug(BalanceDelta swapDelta) private view {
+        console.log("deltaAmount0: %e", swapDelta.amount0());
+        console.log("deltaAmount1: %e", swapDelta.amount1());
+
+        console.log("userToken0Balance: %e", currency0.balanceOf(user));
+        console.log("userToken1Balance: %e", currency1.balanceOf(user));
+    }
+
+    /* LIBRARY */
+    function testFlagConversion() public pure {
+        assertEq(HookLibrary.bpsToLPFee(50), 0x401388); //0x1388 = 5000
+        assertEq(HookLibrary.bpsToLPFee(9900), 0x4f1b30); //0xf1b30 = 9900
+        //auto cap to 100% fee
+        assertEq(HookLibrary.bpsToLPFee(64136), 0x4f4240); //0xf4240 = 1000000
+
+        assertEq(HookLibrary.toLPFee(0x0fffff), 0x4fffff);
+        assertEq(HookLibrary.toLPFee(0xf44444), 0x444444);
+        assertEq(HookLibrary.toLPFee(0xa12345), 0x412345);
+    }
+
+    function test_fuzz_decode_hookdata(bool isInput, uint24 feeLP, address target) public view {
+        bytes memory data = HookLibrary.packHookData(isInput, feeLP, target);
+
+        (bool feeOnInput, uint24 feeBps, address refundTo) = HookTest(payable(address(this))).parseAndUnpack(data);
+        assertEq(feeOnInput, isInput);
+        assertEq(feeBps, feeLP);
+        assertEq(refundTo, target);
+    }
+
+    /* HOOK SWAP */
+
+    function testSwapExactInputA_Hook_FeeInput() public {
+        vm.startPrank(user);
+        _printStartingBalance();
+        bool zeroForOne = true;
+        int256 amountSpecified = -5_000_000e18;
+        uint16 feeBip = 500; //5%
+        bool feeOnInput = true;
+        uint256 expectedFee = FullMath.mulDivRoundingUp(uint256(-amountSpecified), uint256(feeBip), uint256(10000));
+        console.log("swap 5% fee from token0 to token1. ExactInput: %e ", amountSpecified);
+
+        bytes memory data = HookLibrary.packHookData(feeOnInput, HookLibrary.bpsToLPFee(feeBip), user);
+        BalanceDelta swapDelta = swap(key, zeroForOne, amountSpecified, data);
+
+        _printDebug(swapDelta);
+        _printOwnedFee();
+
+        BalanceDelta feesOwed = FeeMath.getFeesOwed(posm, manager, mainPosKey, tokenId);
+
+        assertEq(int256(swapDelta.amount0()), amountSpecified);
+        assertGt(feesOwed.amount0(), 0, "fee not collected on token0");
+        assertApproxEqAbs(uint256(int256(feesOwed.amount0())), expectedFee, 1, "fee earned not equal to expectation");
+        vm.stopPrank();
+    }
+
+    function testSwapExactInputB_Hook_FeeInput() public {
+        vm.startPrank(user);
+        _printStartingBalance();
+        bool zeroForOne = false;
+        int256 amountSpecified = -5_000_000e18;
+        uint16 feeBip = 500; //5%
+        bool feeOnInput = true;
+        uint256 expectedFee = FullMath.mulDivRoundingUp(uint256(-amountSpecified), uint256(feeBip), uint256(10000));
+        console.log("swap 5% fee from token1 to token0. ExactInput: %e ", amountSpecified);
+
+        bytes memory data = HookLibrary.packHookData(feeOnInput, HookLibrary.bpsToLPFee(feeBip), user);
+        BalanceDelta swapDelta = swap(key, zeroForOne, amountSpecified, data);
+
+        _printDebug(swapDelta);
+        _printOwnedFee();
+
+        BalanceDelta feesOwed = FeeMath.getFeesOwed(posm, manager, mainPosKey, tokenId);
+
+        assertEq(int256(swapDelta.amount1()), amountSpecified);
+        assertGt(feesOwed.amount1(), 0, "fee not collected on token0");
+        assertApproxEqAbs(uint256(int256(feesOwed.amount1())), expectedFee, 1, "fee earned not equal to expectation");
+        vm.stopPrank();
+    }
+
+    function testSwapExactInputA_Hook_NoFee() public {
+        vm.startPrank(user);
+        _printStartingBalance();
+        bool zeroForOne = true;
+        int256 amountSpecified = -5_000_000e18;
+        console.log("swap token0 to token1. ExactInput: %e ", amountSpecified);
+
+        bytes memory data = HookLibrary.packHookData(false, 0, user);
+        BalanceDelta swapDelta = swap(key, zeroForOne, amountSpecified, data);
+
+        _printDebug(swapDelta);
+        _printOwnedFee();
+
+        assertEq(int256(swapDelta.amount0()), amountSpecified);
+        vm.stopPrank();
+    }
+
+    function testSwapExactInputA_Hook_FailParse() public {
+        vm.startPrank(user);
+        _printStartingBalance();
+        bool zeroForOne = true;
+        int256 amountSpecified = -5_000_000e18;
+        console.log("swap token0 to token1. ExactInput: %e ", amountSpecified);
+
+        bytes memory data = ZERO_BYTES;
+        BalanceDelta swapDelta = swap(key, zeroForOne, amountSpecified, data);
+
+        _printDebug(swapDelta);
+
+        assertEq(int256(swapDelta.amount0()), amountSpecified);
+        vm.stopPrank();
+    }
+
+    /* NORMAL SWAP */
 
     function testSwapExactInputA() public {
         vm.startPrank(user);
@@ -174,18 +315,5 @@ contract HookTest is Test, Fixtures {
 
         assertEq(int256(swapDelta.amount0()), amountSpecified);
         vm.stopPrank();
-    }
-
-    function _printStartingBalance() private {
-        console.log("userToken0Balance: %e", currency0.balanceOf(user));
-        console.log("userToken1Balance: %e", currency1.balanceOf(user));
-    }
-
-    function _printDebug(BalanceDelta swapDelta) private {
-        console.log("deltaAmount0: %e", swapDelta.amount0());
-        console.log("deltaAmount1: %e", swapDelta.amount1());
-
-        console.log("userToken0Balance: %e", currency0.balanceOf(user));
-        console.log("userToken1Balance: %e", currency1.balanceOf(user));
     }
 }

@@ -7,12 +7,12 @@ import {Owned} from "solmate/src/auth/Owned.sol";
  * @notice Follow Uniswap Pool unlock callback pattern.
  * @dev Rely on transient storage and multicall. Owner open/close permission for single transaction.
  * @dev This is "Extreme" flawed security design. Meant for special use case only.
- * Made implicit for allowing external contract call interaction without worriying about permission. Like `PositionManager.sol`
+ * Allowing external contract call interaction freely without concern about multi-permission. Like `PositionManager.sol`
  * Admin must be contract handle multicall like gnosis safe.
- * Reentrancy attack from ERC20 token is primary security concern. All external call to trusted contract should be safe.
+ * Reentrancy attack from ERC20 token is primary security concern.
  */
 contract DoorLock is Owned {
-    uint transient unlockedLevel;
+    uint transient unlockedKey;
 
     error UnauthorizedAccess(uint current, uint required);
     error AlreadyUnlocked();
@@ -21,20 +21,20 @@ contract DoorLock is Owned {
         
     }
 
-    function Unlock(uint unlockTier) public onlyOwner {
-        if(unlockTier == 0 || unlockTier <= unlockedLevel) {
-            revert AlreadyUnlocked();   
+    function unlock(uint unlockTier) public onlyOwner {
+        if(unlockTier == 0 || unlockTier == unlockedKey) {
+            revert AlreadyUnlocked();
         }
-        unlockedLevel = unlockTier;
+        unlockedKey = unlockTier;
     }
 
-    function Lock() public onlyOwner {
-        unlockedLevel = 0;
+    function lock() public onlyOwner {
+        unlockedKey = 0;
     }
 
-    function _checkSecurity(uint requiredLevel) internal view {
-        if(requiredLevel > unlockedLevel) {
-            revert UnauthorizedAccess(unlockedLevel,requiredLevel);
+    function _checkSecurity(uint key) internal view {
+        if(key != unlockedKey) {
+            revert UnauthorizedAccess(unlockedKey,key);
         }
     }
 }
