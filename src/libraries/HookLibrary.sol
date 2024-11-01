@@ -38,23 +38,4 @@ library HookLibrary {
         return params.amountSpecified > 0;
     }
 
-    /* HELPER */
-    function bpsToLPFee(uint16 bps) internal pure returns (uint24) {
-        if (bps > 10000) {
-            bps = 10000;
-        }
-        return (uint24(bps) * 100) | LPFeeLibrary.OVERRIDE_FEE_FLAG;
-    }
-
-    function toLPFee(uint24 bip) internal pure returns (uint24) {
-        return uint24((bip & 0x0FFFFF)  | LPFeeLibrary.OVERRIDE_FEE_FLAG);
-    }
-
-    function packHookData(bool feeOnInput, uint24 feeBps, address refundTo)
-        internal
-        pure
-        returns (bytes memory hookData)
-    {
-        return abi.encodePacked(feeOnInput, feeBps, refundTo);
-    }
 }
