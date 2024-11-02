@@ -24,6 +24,7 @@ import {Quoter, IQuoter} from "v4-periphery/src/lens/Quoter.sol";
 
 import {EasyPosm} from "./utils/EasyPosm.sol";
 import {Fixtures} from "./utils/Fixtures.sol";
+import {CustomPoolSwapTest,PoolSwapTest} from "./CustomPoolSwapTest.sol";
 
 import "src/Hook.sol";
 import "./Helper.sol";
@@ -50,6 +51,8 @@ contract HookTest is Test, Fixtures {
     function setUp() public {
         // creates the pool manager, utility routers, and test tokens,quoter lens
         deployFreshManagerAndRouters();
+        //replace router with our custom router
+        swapRouter = PoolSwapTest(address(new CustomPoolSwapTest(manager)));
         deployMintAndApprove2Currencies();
         deployAndApprovePosm(manager);
         quoter = new Quoter(manager);
@@ -59,7 +62,7 @@ contract HookTest is Test, Fixtures {
             uint160(
                 Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG
                     | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_INITIALIZE_FLAG
-                    | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG
+                    | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_DONATE_FLAG
             ) ^ (0x4444 << 144) // Namespace the hook to avoid collisions
         );
         bytes memory constructorArgs = abi.encode(owner, manager); //Add all the necessary constructor arguments from the hook
@@ -241,7 +244,7 @@ contract HookTest is Test, Fixtures {
         bool feeOnInput = true;
         bytes memory data = Helper.packHookData(feeOnInput, Helper.toLPFee(lpFee), user);
         //use Quoter to get inputAmount without fee. Then calculate expected Input + fee
-        (uint256 amountIn, uint256 gasEstimate) = quoter.quoteExactOutputSingle(
+        (uint256 amountIn,) = quoter.quoteExactOutputSingle(
             IQuoter.QuoteExactSingleParams({
                 poolKey: key,
                 zeroForOne: zeroForOne,
@@ -250,7 +253,7 @@ contract HookTest is Test, Fixtures {
             })
         );
         // fee = amountIn_withoutfee * fee% / (100% - fee%)
-        uint256 expectedFee = amountIn * lpFee  / (LPFeeLibrary.MAX_LP_FEE - lpFee);
+        uint256 expectedFee = amountIn * lpFee / (LPFeeLibrary.MAX_LP_FEE - lpFee);
         console.log("quote swap without fee. amountIn: %e", amountIn);
         console.log("predict inputFee: %e", expectedFee);
 
@@ -277,7 +280,7 @@ contract HookTest is Test, Fixtures {
         bool feeOnInput = true;
         bytes memory data = Helper.packHookData(feeOnInput, Helper.toLPFee(lpFee), user);
         //use Quoter to get inputAmount without fee. Then calculate expected Input + fee
-        (uint256 amountIn, uint256 gasEstimate) = quoter.quoteExactOutputSingle(
+        (uint256 amountIn,) = quoter.quoteExactOutputSingle(
             IQuoter.QuoteExactSingleParams({
                 poolKey: key,
                 zeroForOne: zeroForOne,
@@ -286,7 +289,7 @@ contract HookTest is Test, Fixtures {
             })
         );
         // fee = amountIn_withoutfee * fee% / (100% - fee%)
-        uint256 expectedFee = amountIn * lpFee  / (LPFeeLibrary.MAX_LP_FEE - lpFee);
+        uint256 expectedFee = amountIn * lpFee / (LPFeeLibrary.MAX_LP_FEE - lpFee);
         console.log("quote swap without fee. amountIn: %e", amountIn);
         console.log("predict inputFee: %e", expectedFee);
 
@@ -334,6 +337,39 @@ contract HookTest is Test, Fixtures {
         _printDebug(swapDelta);
 
         assertEq(int256(swapDelta.amount0()), amountSpecified);
+        vm.stopPrank();
+    }
+
+    function testSwapExactInputA_Hook_FeeOutput() public {
+        vm.startPrank(user);
+        _printStartingBalance();
+        bool zeroForOne = true;
+        int256 amountSpecified = -5_000_000e18;
+        uint24 lpFee = 50000; //5%
+        bool feeOnInput = false;
+        (uint256 amountOut,) = quoter.quoteExactInputSingle(
+            IQuoter.QuoteExactSingleParams({
+                poolKey: key,
+                zeroForOne: zeroForOne,
+                exactAmount: uint128(uint256(-amountSpecified)),
+                hookData: ZERO_BYTES //free swap with no fee
+            })
+        );
+        uint256 expectedFee = FullMath.mulDivRoundingUp(amountOut, lpFee, LPFeeLibrary.MAX_LP_FEE);
+        console.log("swap 5% outputFee from token0 to token1. ExactInput: %e ", amountSpecified);
+        console.log("quote swap without fee. amountOut: %e", amountOut);
+
+        bytes memory data = Helper.packHookData(feeOnInput, Helper.toLPFee(lpFee), user);
+        BalanceDelta swapDelta = swap(key, zeroForOne, amountSpecified, data);
+
+        _printDebug(swapDelta);
+        _printOwnedFee();
+
+        BalanceDelta feesOwed = FeeMath.getFeesOwed(posm, manager, mainPosKey, tokenId);
+
+        assertEq(int256(swapDelta.amount0()), amountSpecified);
+        assertGt(feesOwed.amount1(), 0, "fee not collected on token1");
+        assertApproxEqAbs(uint256(int256(feesOwed.amount1())), expectedFee, 1, "fee earned not equal to expectation");
         vm.stopPrank();
     }
 

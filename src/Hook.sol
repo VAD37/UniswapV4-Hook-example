@@ -11,6 +11,8 @@ import {Owned} from "solmate/src/auth/Owned.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/src/types/BeforeSwapDelta.sol";
 import {CurrencyLibrary, Currency} from "v4-core/src/types/Currency.sol";
+import {SafeCast} from "v4-core/src/libraries/SafeCast.sol";
+import {TransientStateLibrary} from "v4-core/src/libraries/TransientStateLibrary.sol";
 
 import "./DoorLock.sol";
 import "./libraries/Security.sol";
@@ -22,13 +24,17 @@ import {console2} from "forge-std/Test.sol";
 /// @notice DynamicFee is forced to be 0% for this hook.
 /// @notice Allow empty hook data swap for free.
 /// @notice Support take fee from input or output token based on hook data.
+/// @notice Take fee on output token come with lots of **caveat** and gas cost.
 /// @notice Did not take Uniswap Protocol Fee into consideration. Expect uniswap fee to be 0% all the times same as UniswapV2,V3.
 /// @dev fee is optional from HookData. Fee value is bit flag value pass directly to PoolManager.
 /// @dev @note user "exactOutput" != final exactOutput when take fee on output token. exactOutput reduced by a fee after swap. So to get "exactOutput" wanted by user, include fee into consideration. Check `Helper.getExactOutputWithFee()`
 /// @dev This hook refund fee to user. So take fee on output help user only want output token
+/// @dev Take fee on output require taking extra steps and actions after swap.
 contract Hook is DoorLock, BaseHook {
+    using SafeCast for *;
     using HookLibrary for IPoolManager.SwapParams;
     using LPFeeLibrary for uint24;
+    using TransientStateLibrary for IPoolManager;
 
     event TokenWhitelistUpdated(address token, bool isAllowed);
     event Refund(address indexed token, address indexed to, uint256 amount);
@@ -50,7 +56,7 @@ contract Hook is DoorLock, BaseHook {
             beforeSwap: true, //
             afterSwap: true, //
             beforeDonate: false,
-            afterDonate: false,
+            afterDonate: true, // use to clear hook balance
             beforeSwapReturnDelta: true, //@note delta is money "write" to Hook contract balance not to router/user
             afterSwapReturnDelta: true, // It is unclear if swapDelta still used without set beforeSwap to true
             afterAddLiquidityReturnDelta: false,
@@ -150,7 +156,7 @@ contract Hook is DoorLock, BaseHook {
         IPoolManager.SwapParams calldata swapParams,
         BalanceDelta swapResult,
         bytes calldata hookData
-    ) external override returns (bytes4, int128 feeDelta) {
+    ) external override returns (bytes4, int128) {
         require(msg.sender == address(poolManager), OnlyPoolManager());
         //if exactOutput then find input token amount then predict how much fee was taken from that
         console2.log("afterSwap amount0: %e", swapResult.amount0());
@@ -171,9 +177,55 @@ contract Hook is DoorLock, BaseHook {
                 //TODO refund
                 console2.log("refund %e", feeEarned, uint256(lpFee.removeOverrideFlag()));
                 emit Refund(token, refundTo, feeEarned);
+                return (BaseHook.afterSwap.selector, 0);
+            }
+
+            if (!feeOnInput && swapParams.IsExactInput()) {
+                uint256 outputTokenAmount = uint128(swapParams.zeroForOne ? swapResult.amount1() : swapResult.amount0());
+                // if fee is 0.3%. then swapResult for input here already include 0.3% fee.
+                uint256 feeEarned = outputTokenAmount * lpFee.removeOverrideFlag() / LPFeeLibrary.MAX_LP_FEE;
+                address token =
+                    swapParams.zeroForOne ? Currency.unwrap(poolKey.currency1) : Currency.unwrap(poolKey.currency0);
+
+                //TODO refund
+                console2.log("refund %e", feeEarned, uint256(lpFee.removeOverrideFlag()));
+                emit Refund(token, refundTo, feeEarned);
+
+                //@dev must call poolManager.donate() right after swap to move fee from Hook to Pool
+                //user output reduced by fee amount
+                //fee earned is on hook account balance
+                return (BaseHook.afterSwap.selector, feeEarned.toInt128());
             }
         }
 
-        return (BaseHook.afterSwap.selector, feeDelta);
+        return (BaseHook.afterSwap.selector, 0);
+    }
+
+    ///@notice called by router inside swap callback. To move fee from hook to pool. Only for take fee on output token
+    ///@dev UniswapV4 still in early development. Router do not have Post final swap callback yet. So this should be called by custom router
+    ///@dev Current dumb solution is trigger `hook.afterDonate()` inside router by donate() ZERO amount.
+    function postHookSwap(PoolKey calldata poolKey) external {
+        _donateAll(poolKey);
+    }
+
+    function afterDonate(address sender, PoolKey calldata poolKey, uint256, uint256, bytes calldata)
+        external
+        override
+        returns (bytes4)
+    {
+        //prevent infinite loop
+        if (sender != address(this)) {
+            _donateAll(poolKey);
+        }
+        return BaseHook.afterDonate.selector;
+    }
+
+    function _donateAll(PoolKey calldata poolKey) internal {
+        int256 amount0 = poolManager.currencyDelta(address(this), poolKey.currency0);
+        int256 amount1 = poolManager.currencyDelta(address(this), poolKey.currency1);
+        console2.log("donateAll0: %e", amount0);
+        console2.log("donateAll1: %e", amount1);
+        //@dev no safecast seem ok. since this move all Hook balance to our own Position inside private Pool
+        poolManager.donate(poolKey, uint256(amount0), uint256(amount1), new bytes(0));
     }
 }
