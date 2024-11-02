@@ -19,8 +19,9 @@ library Helper {
     }
 
     ///@notice if user want specific outputAmount with fee on output, calculate exactOutputAmount include fee so Hook will return exact specified amount to user after swap
+    ///@dev if user want 5000 token and 5% fee. exactOutput pass to router should be ~5263.1579 token. So swap result after fee will return exact 5000 token as user want
     function getExactOutputWithFee(uint24 feeLP, uint256 specifiedOutputAmount)
-        internal
+        internal pure
         returns (uint256 exactOutputAmount, uint256 fee)
     {
         // fee = specified * fee% / (100% - fee%)

@@ -24,8 +24,8 @@ import {console2} from "forge-std/Test.sol";
 /// @notice Support take fee from input or output token based on hook data.
 /// @notice Did not take Uniswap Protocol Fee into consideration. Expect uniswap fee to be 0% all the times same as UniswapV2,V3.
 /// @dev fee is optional from HookData. Fee value is bit flag value pass directly to PoolManager.
-/// @dev @note fee on output token will prevent from getting exactOutput amount. Call to Router with exactOutput should padded fee amount to `amountSpecified` first. So exactOutput show to user will get correct amount.
-/// @dev This hook refund fee to user. So take fee on output help user only want output token.
+/// @dev @note user "exactOutput" != final exactOutput when take fee on output token. exactOutput reduced by a fee after swap. So to get "exactOutput" wanted by user, include fee into consideration. Check `Helper.getExactOutputWithFee()`
+/// @dev This hook refund fee to user. So take fee on output help user only want output token
 contract Hook is DoorLock, BaseHook {
     using HookLibrary for IPoolManager.SwapParams;
     using LPFeeLibrary for uint24;
@@ -112,7 +112,7 @@ contract Hook is DoorLock, BaseHook {
         if (lpFee.isOverride()) {
             if (feeOnInput) {
                 if (swapParams.IsExactInput()) {
-                // swap fee by default take fee on Input token. No special action taken just refund user fee.
+                    // swap fee by default take fee on Input token. No special action taken just refund user fee.
                     uint256 feeEarned =
                         uint256(-swapParams.amountSpecified) * lpFee.removeOverrideFlag() / LPFeeLibrary.MAX_LP_FEE;
                     address token =
@@ -140,7 +140,6 @@ contract Hook is DoorLock, BaseHook {
             // }
         }
 
-
         return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
@@ -157,21 +156,23 @@ contract Hook is DoorLock, BaseHook {
         console2.log("afterSwap amount0: %e", swapResult.amount0());
         console2.log("afterSwap amount1: %e", swapResult.amount1());
 
-        // HookParams memory hookParams = HookLibrary.softParse(hookData);
+        (bool feeOnInput, uint24 lpFee, address refundTo) = HookLibrary.softParse(hookData);
 
-        // if (swapParams.amountSpecified > 0 && hookParams.lpFeeOverride > 0) {
-        //     // swapResult always negative for input token. So we inverse it.
-        //     uint256 inputTokenAmount = uint128(-(swapParams.zeroForOne ? swapResult.amount0() : swapResult.amount1()));
-        //     // if fee is 0.3%. then swapResult amount here already include 0.3% fee.
-        //     // we divided by 1.003 to get original swap with fee. subtract that to get fee profit. Then refund this to user
-        //     //@not use FullMath cuz lazy
-        //     uint256 feeEarned = inputTokenAmount - (inputTokenAmount * 10000000 / (10000000 + poolKey.fee));
-        //     address token =
-        //         swapParams.zeroForOne ? Currency.unwrap(poolKey.currency0) : Currency.unwrap(poolKey.currency1);
+        if (lpFee.isOverride()) {
+            if (feeOnInput && swapParams.IsExactOutput()) {
+                // swapResult always negative for input token. So we inverse it.
+                uint256 inputTokenAmount =
+                    uint128(-(swapParams.zeroForOne ? swapResult.amount0() : swapResult.amount1()));
+                // if fee is 0.3%. then swapResult for input here already include 0.3% fee.
+                uint256 feeEarned = inputTokenAmount * lpFee.removeOverrideFlag() / LPFeeLibrary.MAX_LP_FEE;
+                address token =
+                    swapParams.zeroForOne ? Currency.unwrap(poolKey.currency0) : Currency.unwrap(poolKey.currency1);
 
-        //     //TODO refund
-        //     emit Refund(token, hookParams.refundTo, feeEarned);
-        // }
+                //TODO refund
+                console2.log("refund %e", feeEarned, uint256(lpFee.removeOverrideFlag()));
+                emit Refund(token, refundTo, feeEarned);
+            }
+        }
 
         return (BaseHook.afterSwap.selector, feeDelta);
     }
