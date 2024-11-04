@@ -53,6 +53,7 @@ contract HookTest is Test, Fixtures {
         deployFreshManagerAndRouters();
         //replace router with our custom router
         swapRouter = PoolSwapTest(address(new CustomPoolSwapTest(manager)));
+        
         deployMintAndApprove2Currencies();
         deployAndApprovePosm(manager);
         quoter = new Quoter(manager);
@@ -355,7 +356,7 @@ contract HookTest is Test, Fixtures {
                 hookData: ZERO_BYTES //free swap with no fee
             })
         );
-        uint256 expectedFee = FullMath.mulDivRoundingUp(amountOut, lpFee, LPFeeLibrary.MAX_LP_FEE);
+        uint256 expectedFee = amountOut * lpFee / LPFeeLibrary.MAX_LP_FEE;
         console.log("swap 5% outputFee from token0 to token1. ExactInput: %e ", amountSpecified);
         console.log("quote swap without fee. amountOut: %e", amountOut);
 
@@ -372,6 +373,177 @@ contract HookTest is Test, Fixtures {
         assertApproxEqAbs(uint256(int256(feesOwed.amount1())), expectedFee, 1, "fee earned not equal to expectation");
         vm.stopPrank();
     }
+    function testSwapExactInputB_Hook_FeeOutput() public {
+        vm.startPrank(user);
+        _printStartingBalance();
+        bool zeroForOne = false;
+        int256 amountSpecified = -5_000_000e18;
+        uint24 lpFee = 50000; //5%
+        bool feeOnInput = false;
+        (uint256 amountOut,) = quoter.quoteExactInputSingle(
+            IQuoter.QuoteExactSingleParams({
+                poolKey: key,
+                zeroForOne: zeroForOne,
+                exactAmount: uint128(uint256(-amountSpecified)),
+                hookData: ZERO_BYTES //free swap with no fee
+            })
+        );
+        uint256 expectedFee = amountOut * lpFee / LPFeeLibrary.MAX_LP_FEE;
+        console.log("swap 5% outputFee from token1 to token0. ExactInput: %e ", amountSpecified);
+        console.log("quote swap without fee. amountOut: %e", amountOut);
+
+        bytes memory data = Helper.packHookData(feeOnInput, Helper.toLPFee(lpFee), user);
+        BalanceDelta swapDelta = swap(key, zeroForOne, amountSpecified, data);
+
+        _printDebug(swapDelta);
+        _printOwnedFee();
+
+        BalanceDelta feesOwed = FeeMath.getFeesOwed(posm, manager, mainPosKey, tokenId);
+
+        assertEq(int256(swapDelta.amount1()), amountSpecified);
+        assertGt(feesOwed.amount0(), 0, "fee not collected on token0");
+        assertApproxEqAbs(uint256(int256(feesOwed.amount0())), expectedFee, 1, "fee earned not equal to expectation");
+        vm.stopPrank();
+    }
+
+    function testSwapExactOutputA_Hook_FeeOutput() public {
+        vm.startPrank(user);
+        _printStartingBalance();
+        bool zeroForOne = true;
+        int256 amountSpecified = 5_000_000e18;
+        uint24 lpFee = 50000; //5%
+        bool feeOnInput = false;
+        //swap exactOutput with fee on output is the same as swap exactInput with fee on input
+        //Quoter here predict inversed swap with same token with price 1:1 ratio. So it can guarantee that the swap is correct
+
+        //Check 1: check the price of both token is the same
+        (uint amountOut1,) = quoter.quoteExactInputSingle(
+            IQuoter.QuoteExactSingleParams({
+                poolKey: key,
+                zeroForOne: zeroForOne,
+                exactAmount: uint128(uint256(amountSpecified)), 
+                hookData: ZERO_BYTES //free swap with no fee
+            })
+        );
+        (uint amountOut2,) = quoter.quoteExactInputSingle(
+            IQuoter.QuoteExactSingleParams({
+                poolKey: key,
+                zeroForOne: !zeroForOne,
+                exactAmount: uint128(uint256(amountSpecified)),
+                hookData: ZERO_BYTES //free swap with no fee
+            })
+        );
+        assertEq(amountOut1, amountOut2, "This special test case require price of both token0 and token1 the same");
+        ///Check 2: predict output swap through math and compare that to Quoter swap ExactInput 
+        // if swap exactOutput 5000 token1 with on output, total swap Output result will be 5063 token1. "63" is 5% fee on output token1.
+        //Then inverse swap exactInput 5063 token0 with fee on input token0 should also result in 5000 token1. Assuming same price condition.
+        (uint256 exactOutputAmount, uint256 expectedFee) = Helper.getExactOutputAfterFee(lpFee, uint256(amountSpecified));
+        // console2.log("predict total OutputTokenAmount swapped: %e", exactOutputAmount);
+        (uint expected_amountIn,) = quoter.quoteExactOutputSingle(
+            IQuoter.QuoteExactSingleParams({
+                poolKey: key,
+                zeroForOne: true,
+                exactAmount: uint128(exactOutputAmount),
+                hookData: ZERO_BYTES //@fee = 0 as intended
+            })
+        );
+        // console2.log("predict total InputTokenAmount swapped: %e", expected_amountIn);
+        (uint amountOut,) = quoter.quoteExactInputSingle(
+            IQuoter.QuoteExactSingleParams({
+                poolKey: key,
+                zeroForOne: true,
+                exactAmount: uint128(uint256(expected_amountIn)),
+                hookData: Helper.packHookData(feeOnInput, Helper.toLPFee(lpFee), user)
+            })
+        );
+        assertEq(amountOut, uint(amountSpecified), "Unique test case. Quote price failed");
+
+        // Normal swap 
+        console.log("swap 5% outputFee from token0 to token1. ExactOutput %e token1", amountSpecified);
+
+        bytes memory data = Helper.packHookData(feeOnInput, Helper.toLPFee(lpFee), user);
+        BalanceDelta swapDelta = swap(key, zeroForOne, amountSpecified, data);
+
+        _printDebug(swapDelta);
+        _printOwnedFee();
+
+        BalanceDelta feesOwed = FeeMath.getFeesOwed(posm, manager, mainPosKey, tokenId);
+
+        assertEq(int256(swapDelta.amount1()), amountSpecified);
+        assertGt(feesOwed.amount1(), 0, "fee not collected on token0");
+        assertApproxEqAbs(uint256(int256(feesOwed.amount1())), expectedFee, 1, "fee earned not equal to expectation");
+        vm.stopPrank();
+    }
+    function testSwapExactOutputB_Hook_FeeOutput() public {
+        vm.startPrank(user);
+        _printStartingBalance();
+        bool zeroForOne = false;
+        int256 amountSpecified = 5_000_000e18;
+        uint24 lpFee = 50000; //5%
+        bool feeOnInput = false;
+        //swap exactOutput with fee on output is the same as swap exactInput with fee on input
+        //Quoter here predict inversed swap with same token with price 1:1 ratio. So it can guarantee that the swap is correct
+
+        //Check 1: check the price of both token is the same
+        (uint amountOut1,) = quoter.quoteExactInputSingle(
+            IQuoter.QuoteExactSingleParams({
+                poolKey: key,
+                zeroForOne: zeroForOne,
+                exactAmount: uint128(uint256(amountSpecified)), 
+                hookData: ZERO_BYTES //free swap with no fee
+            })
+        );
+        (uint amountOut2,) = quoter.quoteExactInputSingle(
+            IQuoter.QuoteExactSingleParams({
+                poolKey: key,
+                zeroForOne: !zeroForOne,
+                exactAmount: uint128(uint256(amountSpecified)),
+                hookData: ZERO_BYTES //free swap with no fee
+            })
+        );
+        assertEq(amountOut1, amountOut2, "This special test case require price of both token0 and token1 the same");
+        ///Check 2: predict output swap through math and compare that to Quoter swap ExactInput 
+        // if swap exactOutput 5000 token1 with on output, total swap Output result will be 5063 token1. "63" is 5% fee on output token1.
+        //Then inverse swap exactInput 5063 token0 with fee on input token0 should also result in 5000 token1. Assuming same price condition.
+        (uint256 exactOutputAmount, uint256 expectedFee) = Helper.getExactOutputAfterFee(lpFee, uint256(amountSpecified));
+        // console2.log("predict total OutputTokenAmount swapped: %e", exactOutputAmount);
+        (uint expected_amountIn,) = quoter.quoteExactOutputSingle(
+            IQuoter.QuoteExactSingleParams({
+                poolKey: key,
+                zeroForOne: false,
+                exactAmount: uint128(exactOutputAmount),
+                hookData:
+                    ZERO_BYTES //@fee = 0 as intended
+            })
+        );
+        // console2.log("predict total InputTokenAmount swapped: %e", expected_amountIn);
+        (uint amountOut,) = quoter.quoteExactInputSingle(
+            IQuoter.QuoteExactSingleParams({
+                poolKey: key,
+                zeroForOne: false,
+                exactAmount: uint128(uint256(expected_amountIn)),
+                hookData: Helper.packHookData(feeOnInput, Helper.toLPFee(lpFee), user)
+            })
+        );
+        assertEq(amountOut, uint(amountSpecified), "Unique test case. Quote price failed");
+
+        // Normal swap
+        console.log("swap 5% outputFee from token1 to token0. ExactOutput %e token0", amountSpecified);
+
+        bytes memory data = Helper.packHookData(feeOnInput, Helper.toLPFee(lpFee), user);
+        BalanceDelta swapDelta = swap(key, zeroForOne, amountSpecified, data);
+
+        _printDebug(swapDelta);
+        _printOwnedFee();
+
+        BalanceDelta feesOwed = FeeMath.getFeesOwed(posm, manager, mainPosKey, tokenId);
+
+        assertEq(int256(swapDelta.amount0()), amountSpecified);
+        assertGt(feesOwed.amount0(), 0, "fee not collected on token0");
+        assertApproxEqAbs(uint256(int256(feesOwed.amount0())), expectedFee, 1, "fee earned not equal to expectation");
+        vm.stopPrank();
+    }
+
 
     /* NORMAL SWAP */
 
