@@ -24,10 +24,14 @@ import {Quoter, IQuoter} from "v4-periphery/src/lens/Quoter.sol";
 
 import {EasyPosm} from "./utils/EasyPosm.sol";
 import {Fixtures} from "./utils/Fixtures.sol";
-import {CustomPoolSwapTest,PoolSwapTest} from "./CustomPoolSwapTest.sol";
+import {CustomPoolSwapTest, PoolSwapTest} from "./CustomPoolSwapTest.sol";
 
 import "src/Hook.sol";
 import "./Helper.sol";
+
+contract MockBank is DebtIssuer {
+    function issueDebt(Currency currency, uint256 amount, address toUser) external {}
+}
 
 contract HookTest is Test, Fixtures {
     using EasyPosm for IPositionManager;
@@ -53,7 +57,7 @@ contract HookTest is Test, Fixtures {
         deployFreshManagerAndRouters();
         //replace router with our custom router
         swapRouter = PoolSwapTest(address(new CustomPoolSwapTest(manager)));
-        
+
         deployMintAndApprove2Currencies();
         deployAndApprovePosm(manager);
         quoter = new Quoter(manager);
@@ -66,23 +70,27 @@ contract HookTest is Test, Fixtures {
                     | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_DONATE_FLAG
             ) ^ (0x4444 << 144) // Namespace the hook to avoid collisions
         );
-        bytes memory constructorArgs = abi.encode(owner, manager); //Add all the necessary constructor arguments from the hook
+
+        address mockBank = address(new MockBank());
+
+        bytes memory constructorArgs = abi.encode(owner, manager, mockBank); //Add all the necessary constructor arguments from the hook
         deployCodeTo("Hook.sol:Hook", constructorArgs, flags);
         hook = Hook(flags);
-        //tell hook to unlock permission first before Add new liquidity
-        hook.unlock(Security.BASIC);
+        
 
         // Create the pool
         uint24 fee = LPFeeLibrary.DYNAMIC_FEE_FLAG;
-        key = PoolKey(currency0, currency1, fee, 60, IHooks(hook));
+        key = PoolKey(currency0, currency1, fee, 10, IHooks(hook));
         poolId = key.toId();
+        //tell hook to unlock permission first before Add new liquidity
+        hook.unlock(Security.BASIC);
         manager.initialize(key, SQRT_PRICE_1_1);
 
         // Provide full-range liquidity to the pool
         tickLower = TickMath.minUsableTick(key.tickSpacing);
         tickUpper = TickMath.maxUsableTick(key.tickSpacing);
 
-        uint128 liquidityAmount = 100_000_000e18;
+        uint128 liquidityAmount = 90_000_000e18;
 
         (uint256 amount0Expected, uint256 amount1Expected) = LiquidityAmounts.getAmountsForLiquidity(
             SQRT_PRICE_1_1,
@@ -92,7 +100,7 @@ contract HookTest is Test, Fixtures {
         );
 
         // console.log("Pool token balance. amount0: %e, amount1: %e", amount0Expected, amount1Expected);
-
+        hook.unlock(Security.BASIC);
         (tokenId,) = posm.mint(
             key,
             tickLower,
@@ -105,9 +113,6 @@ contract HookTest is Test, Fixtures {
             ZERO_BYTES
         );
         mainPosKey = PositionConfig({poolKey: key, tickLower: tickLower, tickUpper: tickUpper});
-
-        // lock admin permission after setup done
-        hook.lock();
 
         // send token to user
         seedBalance(user); //10_000_000e18
@@ -373,6 +378,7 @@ contract HookTest is Test, Fixtures {
         assertApproxEqAbs(uint256(int256(feesOwed.amount1())), expectedFee, 1, "fee earned not equal to expectation");
         vm.stopPrank();
     }
+
     function testSwapExactInputB_Hook_FeeOutput() public {
         vm.startPrank(user);
         _printStartingBalance();
@@ -417,15 +423,15 @@ contract HookTest is Test, Fixtures {
         //Quoter here predict inversed swap with same token with price 1:1 ratio. So it can guarantee that the swap is correct
 
         //Check 1: check the price of both token is the same
-        (uint amountOut1,) = quoter.quoteExactInputSingle(
+        (uint256 amountOut1,) = quoter.quoteExactInputSingle(
             IQuoter.QuoteExactSingleParams({
                 poolKey: key,
                 zeroForOne: zeroForOne,
-                exactAmount: uint128(uint256(amountSpecified)), 
+                exactAmount: uint128(uint256(amountSpecified)),
                 hookData: ZERO_BYTES //free swap with no fee
             })
         );
-        (uint amountOut2,) = quoter.quoteExactInputSingle(
+        (uint256 amountOut2,) = quoter.quoteExactInputSingle(
             IQuoter.QuoteExactSingleParams({
                 poolKey: key,
                 zeroForOne: !zeroForOne,
@@ -434,12 +440,13 @@ contract HookTest is Test, Fixtures {
             })
         );
         assertEq(amountOut1, amountOut2, "This special test case require price of both token0 and token1 the same");
-        ///Check 2: predict output swap through math and compare that to Quoter swap ExactInput 
+        ///Check 2: predict output swap through math and compare that to Quoter swap ExactInput
         // if swap exactOutput 5000 token1 with on output, total swap Output result will be 5063 token1. "63" is 5% fee on output token1.
         //Then inverse swap exactInput 5063 token0 with fee on input token0 should also result in 5000 token1. Assuming same price condition.
-        (uint256 exactOutputAmount, uint256 expectedFee) = Helper.getExactOutputAfterFee(lpFee, uint256(amountSpecified));
+        (uint256 exactOutputAmount, uint256 expectedFee) =
+            Helper.getExactOutputAfterFee(lpFee, uint256(amountSpecified));
         // console2.log("predict total OutputTokenAmount swapped: %e", exactOutputAmount);
-        (uint expected_amountIn,) = quoter.quoteExactOutputSingle(
+        (uint256 expected_amountIn,) = quoter.quoteExactOutputSingle(
             IQuoter.QuoteExactSingleParams({
                 poolKey: key,
                 zeroForOne: true,
@@ -448,7 +455,7 @@ contract HookTest is Test, Fixtures {
             })
         );
         // console2.log("predict total InputTokenAmount swapped: %e", expected_amountIn);
-        (uint amountOut,) = quoter.quoteExactInputSingle(
+        (uint256 amountOut,) = quoter.quoteExactInputSingle(
             IQuoter.QuoteExactSingleParams({
                 poolKey: key,
                 zeroForOne: true,
@@ -456,9 +463,9 @@ contract HookTest is Test, Fixtures {
                 hookData: Helper.packHookData(feeOnInput, Helper.toLPFee(lpFee), user)
             })
         );
-        assertEq(amountOut, uint(amountSpecified), "Unique test case. Quote price failed");
+        assertEq(amountOut, uint256(amountSpecified), "Unique test case. Quote price failed");
 
-        // Normal swap 
+        // Normal swap
         console.log("swap 5% outputFee from token0 to token1. ExactOutput %e token1", amountSpecified);
 
         bytes memory data = Helper.packHookData(feeOnInput, Helper.toLPFee(lpFee), user);
@@ -474,6 +481,7 @@ contract HookTest is Test, Fixtures {
         assertApproxEqAbs(uint256(int256(feesOwed.amount1())), expectedFee, 1, "fee earned not equal to expectation");
         vm.stopPrank();
     }
+
     function testSwapExactOutputB_Hook_FeeOutput() public {
         vm.startPrank(user);
         _printStartingBalance();
@@ -485,15 +493,15 @@ contract HookTest is Test, Fixtures {
         //Quoter here predict inversed swap with same token with price 1:1 ratio. So it can guarantee that the swap is correct
 
         //Check 1: check the price of both token is the same
-        (uint amountOut1,) = quoter.quoteExactInputSingle(
+        (uint256 amountOut1,) = quoter.quoteExactInputSingle(
             IQuoter.QuoteExactSingleParams({
                 poolKey: key,
                 zeroForOne: zeroForOne,
-                exactAmount: uint128(uint256(amountSpecified)), 
+                exactAmount: uint128(uint256(amountSpecified)),
                 hookData: ZERO_BYTES //free swap with no fee
             })
         );
-        (uint amountOut2,) = quoter.quoteExactInputSingle(
+        (uint256 amountOut2,) = quoter.quoteExactInputSingle(
             IQuoter.QuoteExactSingleParams({
                 poolKey: key,
                 zeroForOne: !zeroForOne,
@@ -502,22 +510,22 @@ contract HookTest is Test, Fixtures {
             })
         );
         assertEq(amountOut1, amountOut2, "This special test case require price of both token0 and token1 the same");
-        ///Check 2: predict output swap through math and compare that to Quoter swap ExactInput 
+        ///Check 2: predict output swap through math and compare that to Quoter swap ExactInput
         // if swap exactOutput 5000 token1 with on output, total swap Output result will be 5063 token1. "63" is 5% fee on output token1.
         //Then inverse swap exactInput 5063 token0 with fee on input token0 should also result in 5000 token1. Assuming same price condition.
-        (uint256 exactOutputAmount, uint256 expectedFee) = Helper.getExactOutputAfterFee(lpFee, uint256(amountSpecified));
+        (uint256 exactOutputAmount, uint256 expectedFee) =
+            Helper.getExactOutputAfterFee(lpFee, uint256(amountSpecified));
         // console2.log("predict total OutputTokenAmount swapped: %e", exactOutputAmount);
-        (uint expected_amountIn,) = quoter.quoteExactOutputSingle(
+        (uint256 expected_amountIn,) = quoter.quoteExactOutputSingle(
             IQuoter.QuoteExactSingleParams({
                 poolKey: key,
                 zeroForOne: false,
                 exactAmount: uint128(exactOutputAmount),
-                hookData:
-                    ZERO_BYTES //@fee = 0 as intended
+                hookData: ZERO_BYTES //@fee = 0 as intended
             })
         );
         // console2.log("predict total InputTokenAmount swapped: %e", expected_amountIn);
-        (uint amountOut,) = quoter.quoteExactInputSingle(
+        (uint256 amountOut,) = quoter.quoteExactInputSingle(
             IQuoter.QuoteExactSingleParams({
                 poolKey: key,
                 zeroForOne: false,
@@ -525,7 +533,7 @@ contract HookTest is Test, Fixtures {
                 hookData: Helper.packHookData(feeOnInput, Helper.toLPFee(lpFee), user)
             })
         );
-        assertEq(amountOut, uint(amountSpecified), "Unique test case. Quote price failed");
+        assertEq(amountOut, uint256(amountSpecified), "Unique test case. Quote price failed");
 
         // Normal swap
         console.log("swap 5% outputFee from token1 to token0. ExactOutput %e token0", amountSpecified);
@@ -543,7 +551,6 @@ contract HookTest is Test, Fixtures {
         assertApproxEqAbs(uint256(int256(feesOwed.amount0())), expectedFee, 1, "fee earned not equal to expectation");
         vm.stopPrank();
     }
-
 
     /* NORMAL SWAP */
 

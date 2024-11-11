@@ -20,6 +20,10 @@ import "./libraries/HookLibrary.sol";
 
 import {console2} from "forge-std/Test.sol";
 
+interface DebtIssuer {
+    function issueDebt(Currency currency, uint256 amount, address toUser) external;
+}
+
 /// @title Uniswap Hook for private pool that refund 100% fee back. Made to support free infrastructure in spirit.
 /// @notice DynamicFee is forced to be 0% for this hook. Use override fee based on HookData.
 /// @notice Allow any contract to swap for free. Anyone can make unofficial website to help user swap for free. Only holding fee for user going through main channel.
@@ -42,12 +46,19 @@ contract Hook is DoorLock, BaseHook {
 
     error OnlyPoolManager();
 
-    constructor(address _owner, address _poolManager) DoorLock(_owner) BaseHook(IPoolManager(_poolManager)) {}
+    DebtIssuer public debtor;
+
+    constructor(address _owner, address _poolManager, address _debtor)
+        DoorLock(_owner)
+        BaseHook(IPoolManager(_poolManager))
+    {
+        debtor = DebtIssuer(_debtor);
+    }
 
     ///@dev immutable variable does not work with Hook struct.
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
-            beforeInitialize: true, //prevent unknown pool hook by mistake
+            beforeInitialize: true, //prevent unknown pool hook
             afterInitialize: false,
             beforeAddLiquidity: true, // prevent user from adding liquidity
             afterAddLiquidity: false,
@@ -57,8 +68,8 @@ contract Hook is DoorLock, BaseHook {
             afterSwap: true, //
             beforeDonate: false,
             afterDonate: true, // use to clear hook balance
-            beforeSwapReturnDelta: true, //@note delta is money "write" to Hook contract balance not to router/user
-            afterSwapReturnDelta: true, // It is unclear if swapDelta still used without set beforeSwap to true
+            beforeSwapReturnDelta: true, //swapReturnDelta change how much input,output token is exchanged.
+            afterSwapReturnDelta: true,
             afterAddLiquidityReturnDelta: false,
             afterRemoveLiquidityReturnDelta: false
         });
@@ -68,24 +79,23 @@ contract Hook is DoorLock, BaseHook {
 
     function beforeInitialize(address, PoolKey calldata poolKey, uint160) external virtual override returns (bytes4) {
         //Always assume trusted admin know what they are doing
-        _checkSecurity(Security.BASIC);
+        _checkSecurityAndLock(Security.BASIC);
         require(msg.sender == address(poolManager), OnlyPoolManager());
         require(poolKey.hooks == IHooks(address(this)), "Wrong Hook");
         require(poolKey.fee == LPFeeLibrary.DYNAMIC_FEE_FLAG, "Must be Dynamic Fee");
         return BaseHook.beforeInitialize.selector;
     }
 
-    ///@notice This Private pool should have a single Position.
-    ///@dev Unlock Security here allow simple position ownership handling
-    ///@dev sender expected to be PositionManager.sol
-    ///@dev It is caller responsibility to prevent reentrancy attack
+    ///@notice This Private pool should be managed by Bank contract directly. Not going though PositionManager.
+    ///@dev Unlock Security here allow simpler ownership handling. Since hook do not care who is the caller.
+    ///@dev it is possible to force Hook always take ownedFee from position and redirect that gain to Bank, allowing Position to be controlled by anone. But it is much faster to have admin manually control position offchain
+    /// Also if hook take fee from liquidity then router also have to donate fee back from hook to bank.
     function beforeAddLiquidity(address, PoolKey calldata, IPoolManager.ModifyLiquidityParams calldata, bytes calldata)
         external
         override
         returns (bytes4)
     {
-        _checkSecurity(Security.BASIC);
-        emit PlaceHolder();
+        _checkSecurityAndLock(Security.BASIC);
         return BaseHook.beforeAddLiquidity.selector;
     }
 
@@ -95,8 +105,7 @@ contract Hook is DoorLock, BaseHook {
         IPoolManager.ModifyLiquidityParams calldata,
         bytes calldata
     ) external override returns (bytes4) {
-        _checkSecurity(Security.BASIC);
-        emit PlaceHolder();
+        _checkSecurityAndLock(Security.BASIC);
         return BaseHook.beforeRemoveLiquidity.selector;
     }
 
@@ -125,11 +134,8 @@ contract Hook is DoorLock, BaseHook {
                 //input always negative
                 uint256 feeAmount =
                     uint256(-swapParams.amountSpecified) * lpFee.removeOverrideFlag() / LPFeeLibrary.MAX_LP_FEE;
-                address token =
-                    swapParams.zeroForOne ? Currency.unwrap(poolKey.currency0) : Currency.unwrap(poolKey.currency1);
-                //TODO refund
-                console2.log("refund %e", feeAmount, uint256(lpFee.removeOverrideFlag()));
-                emit Refund(token, refundTo, feeAmount);
+                Currency currency = swapParams.zeroForOne ? poolKey.currency0 : poolKey.currency1;
+                debtor.issueDebt(currency, feeAmount, refundTo);
             }
             //if fee on input, but specified exactOutput.
             // wait until afterSwap to get unspecified input amount before refund fee.
@@ -143,11 +149,9 @@ contract Hook is DoorLock, BaseHook {
             // feeAmount = specifiedAmount * fee% / (100%-fee%)
             uint256 fee = lpFee.removeOverrideFlag();
             uint256 feeAmount = uint256(swapParams.amountSpecified) * fee / (LPFeeLibrary.MAX_LP_FEE - fee);
-            address token =
-                swapParams.zeroForOne ? Currency.unwrap(poolKey.currency1) : Currency.unwrap(poolKey.currency0);
-            //TODO refund
-            console2.log("refund %e", feeAmount, uint256(lpFee.removeOverrideFlag()));
-            emit Refund(token, refundTo, feeAmount);
+            Currency currency = swapParams.zeroForOne ? poolKey.currency1 : poolKey.currency0;
+
+            debtor.issueDebt(currency, feeAmount, refundTo);
             int128 feeDelta = feeAmount.toInt128();
             //toBeforeSwapDelta(specified,unspecified)
             //here we increase specified token which is exactOutput
@@ -182,23 +186,18 @@ contract Hook is DoorLock, BaseHook {
             uint256 inputTokenAmount = uint128(-(swapParams.zeroForOne ? swapResult.amount0() : swapResult.amount1()));
             // feeAmount = totalInput * fee%
             uint256 feeAmount = inputTokenAmount * lpFee.removeOverrideFlag() / LPFeeLibrary.MAX_LP_FEE;
-            address token =
-                swapParams.zeroForOne ? Currency.unwrap(poolKey.currency0) : Currency.unwrap(poolKey.currency1);
 
-            //TODO refund
-            console2.log("refund %e", feeAmount, uint256(lpFee.removeOverrideFlag()));
-            emit Refund(token, refundTo, feeAmount);
+            Currency currency = swapParams.zeroForOne ? poolKey.currency0 : poolKey.currency1;
+            debtor.issueDebt(currency, feeAmount, refundTo);
+
             return (BaseHook.afterSwap.selector, 0);
         } else if (!feeOnInput && swapParams.IsExactInput()) {
             uint256 outputTokenAmount = uint128(swapParams.zeroForOne ? swapResult.amount1() : swapResult.amount0());
             // if fee is 0.3%. then swapResult for input here already include 0.3% fee.
             uint256 feeAmount = outputTokenAmount * lpFee.removeOverrideFlag() / LPFeeLibrary.MAX_LP_FEE;
-            address token =
-                swapParams.zeroForOne ? Currency.unwrap(poolKey.currency1) : Currency.unwrap(poolKey.currency0);
 
-            //TODO refund
-            console2.log("refund %e", feeAmount, uint256(lpFee.removeOverrideFlag()));
-            emit Refund(token, refundTo, feeAmount);
+            Currency currency = swapParams.zeroForOne ? poolKey.currency1 : poolKey.currency0;
+            debtor.issueDebt(currency, feeAmount, refundTo);
 
             //@dev must call poolManager.donate() right after swap to move fee from Hook to Position
             //user output reduced by fee amount
@@ -231,7 +230,7 @@ contract Hook is DoorLock, BaseHook {
     function _donateAll(PoolKey calldata poolKey) internal {
         int256 amount0 = poolManager.currencyDelta(address(this), poolKey.currency0);
         int256 amount1 = poolManager.currencyDelta(address(this), poolKey.currency1);
-        //@dev no safecast seem ok, pool revert on wrong balance accounting. since this move all Hook balance to our own Position inside private Pool
+        //@dev no safecast seem ok, pool revert on wrong balance accounting. Since this only move all Hook balance to our own Position
         poolManager.donate(poolKey, uint256(amount0), uint256(amount1), new bytes(0));
     }
 }
