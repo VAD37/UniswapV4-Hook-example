@@ -17,7 +17,7 @@ import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 ///@dev At all times, Bank must always have surplus of currency to repay debt to user. So investment > debt.
 ///@dev All fee generated from the pool belong to user and it is count as bank debt. Bank temporary hold the fee and reinvest it to lending activity.
 ///@dev Bank have obligation to repay user debt if they want to reclaim at any time. The only fee user inccur are gas cost.
-///@dev Bank token internally provide fixed interest rate. So all bank lending to AAVE,Compound or other lending platform should provide enough surplus to cover interest rate.
+///@dev Bank token internally provide fixed interest rate. So whatever bank do with money should always return more than what user gain.
 contract SimpleBank is Owned, SafeCallback {
     using Security for address;
     using SafeTransferLib for ERC20;
